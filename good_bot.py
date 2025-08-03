@@ -18,7 +18,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise ValueError("Токен бота не найден в .env файле!")
 
-# Инициализация бота
+# Инициализация бота и диспетчера
 bot = Bot(token=BOT_TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
@@ -26,8 +26,8 @@ scheduler = AsyncIOScheduler()
 
 # Программы голодания
 FASTING_PROGRAMS = {
-    "16/8": (16, 8),
-    "18/6": (18, 6), 
+    "16/8": (16, 8),  # 16 часов голодания, 8 часов окно питания
+    "18/6": (18, 6),
     "20/4": (20, 4),
 }
 
@@ -36,138 +36,175 @@ class FastingStates(StatesGroup):
     WAITING_PROGRAM = State()
     WAITING_TIME = State()
     CONFIRMATION = State()
+    FASTING_PERIOD = State()  # Новое состояние для периода голодания
 
-# ========================
-# Обработчики сообщений
-# ========================
-
-# Команда /start
+# Обработчики
 @dp.message(Command("start"))
-async def start_handler(message: types.Message):
+async def start_handler(message: types.Message, state: FSMContext):
+    buttons = [
+        [types.KeyboardButton(text=program)]
+        for program in FASTING_PROGRAMS
+    ]
     keyboard = types.ReplyKeyboardMarkup(
-        keyboard=[[types.KeyboardButton(text=program)] for program in FASTING_PROGRAMS],
+        keyboard=buttons,
         resize_keyboard=True
     )
-
+    
     await message.answer(
         "🏆 Выберите программу интервального голодания:",
         reply_markup=keyboard
     )
     await state.set_state(FastingStates.WAITING_PROGRAM)
 
-# Обработка выбора программы
 @dp.message(FastingStates.WAITING_PROGRAM)
 async def program_handler(message: types.Message, state: FSMContext):
     if message.text not in FASTING_PROGRAMS:
         await message.answer("Пожалуйста, выберите программу из списка.")
         return
-
+    
     await state.update_data(program=message.text)
     await message.answer(
         "⏳ Введите время последнего приема пищи в формате ЧЧ:ММ\n"
         "Или нажмите /now чтобы использовать текущее время",
         reply_markup=types.ReplyKeyboardRemove()
     )
-    await dp.fsm.set_state(user_id=message.from_user.id, state=FastingStates.WAITING_TIME)
+    await state.set_state(FastingStates.WAITING_TIME)
 
-# Обработка ввода времени
 @dp.message(FastingStates.WAITING_TIME)
 async def time_handler(message: types.Message, state: FSMContext):
     data = await state.get_data()
 
+    # Определяем время последнего приёма пищи
     if message.text == "/now":
         last_meal = dt.datetime.now()
     else:
         try:
             hours, minutes = map(int, message.text.split(":"))
-            last_meal = dt.datetime.now().replace(
-                hour=hours,
-                minute=minutes,
-                second=0,
-                microsecond=0
-            )
+            now = dt.datetime.now()
+            last_meal = now.replace(hour=hours, minute=minutes, second=0, microsecond=0)
+
+            # Если указанное время позже текущего — предположим, это вчерашний приём
+            if last_meal > now:
+                last_meal -= dt.timedelta(days=1)
+
         except ValueError:
             await message.answer("❌ Неверный формат времени. Используйте ЧЧ:ММ")
             return
 
     fasting_hours, eating_hours = FASTING_PROGRAMS[data["program"]]
-    fasting_end = last_meal + dt.timedelta(hours=fasting_hours)
-    window_end = last_meal + dt.timedelta(hours=eating_hours)
+
+    # Расчёт времени
+    fasting_start = last_meal  # последний приём — начало голодания
+    fasting_end = fasting_start + dt.timedelta(hours=fasting_hours)
+    eating_window_start = last_meal - dt.timedelta(hours=eating_hours)
 
     await state.update_data(
         last_meal=last_meal,
+        fasting_start=fasting_start,
         fasting_end=fasting_end,
-        window_end=window_end
+        eating_window_start=eating_window_start,
     )
 
-    # Запланировать напоминание через 5 минут после окна питания
-    reminder_time = window_end + dt.timedelta(minutes=5)
+    # Планируем уведомления
     scheduler.add_job(
-        send_reminder,
+        notify_fasting_start,
         "date",
-        run_date=reminder_time,
+        run_date=fasting_start,
+        args=[message.chat.id],
+    )
+
+    scheduler.add_job(
+        notify_fasting_end,
+        "date",
+        run_date=fasting_end - dt.timedelta(minutes=30),
+        args=[message.chat.id],
+    )
+
+    scheduler.add_job(
+        notify_fasting_complete,
+        "date",
+        run_date=fasting_end,
         args=[message.chat.id],
     )
 
     # Клавиатура подтверждения
+    confirm_buttons = [
+        [types.KeyboardButton(text="✅ Подтвердить")],
+        [types.KeyboardButton(text="✏️ Изменить время")],
+        [types.KeyboardButton(text="❌ Отмена")]
+    ]
     keyboard = types.ReplyKeyboardMarkup(
-        keyboard=[
-            [types.KeyboardButton(text="✅ Всё верно")],
-            [types.KeyboardButton(text="✏️ Исправить время")]
-        ],
+        keyboard=confirm_buttons,
         resize_keyboard=True
     )
 
     await message.answer(
         f"🔍 Проверьте данные:\n"
         f"▪ Программа: {data['program']}\n"
-        f"▪ Последний прием: {last_meal.strftime('%H:%M')}\n"
-        f"▪ Окно питания до: {window_end.strftime('%H:%M')}\n"
+        f"▪ Последний приём: {last_meal.strftime('%H:%M')}\n"
+        f"▪ Окно питания: с {eating_window_start.strftime('%H:%M')} до {last_meal.strftime('%H:%M')}\n"
         f"▪ Голодание до: {fasting_end.strftime('%H:%M')}\n\n"
-        f"Если всё правильно, нажмите <b>✅ Всё верно</b>",
+        f"Если всё верно, нажмите <b>✅ Подтвердить</b>",
         reply_markup=keyboard,
         parse_mode="HTML"
     )
-    await dp.fsm.set_state(user_id=message.from_user.id, state=FastingStates.CONFIRMATION)
 
-# Напоминание о проверке времени
-async def send_reminder(chat_id: int):
+    await state.set_state(FastingStates.CONFIRMATION)
+
+
+async def notify_eating_window_end(chat_id: int):
     await bot.send_message(
         chat_id,
-        "🔄 Вы поели? Если нужно изменить время последнего приема пищи, "
-        "нажмите /edit_time",
+        "🕒 Окно питания заканчивается через 30 минут!",
         reply_markup=types.ReplyKeyboardRemove()
     )
 
-# Обработка подтверждения
+async def notify_fasting_start(chat_id: int):
+    await bot.send_message(
+        chat_id,
+        "⏳ Период голодания начался!",
+        reply_markup=types.ReplyKeyboardRemove()
+    )
+
+async def notify_fasting_end(chat_id: int):
+    await bot.send_message(
+        chat_id,
+        "🕒 Голодание заканчивается через 30 минут!",
+        reply_markup=types.ReplyKeyboardRemove()
+    )
+
 @dp.message(FastingStates.CONFIRMATION)
 async def confirmation_handler(message: types.Message, state: FSMContext):
-    if message.text == "✅ Всё верно":
+    if message.text == "✅ Подтвердить":
         data = await state.get_data()
         await message.answer(
             f"⏳ Голодание начато! Следующий прием пищи в {data['fasting_end'].strftime('%H:%M')}",
             reply_markup=types.ReplyKeyboardRemove()
         )
-        await state.clear()
-    elif message.text == "✏️ Исправить время":
+        await state.set_state(FastingStates.FASTING_PERIOD)
+    elif message.text == "✏️ Изменить время":
         await message.answer(
             "🔄 Введите новое время последнего приема пищи (ЧЧ:ММ) или /now",
             reply_markup=types.ReplyKeyboardRemove()
         )
-        await dp.fsm.set_state(user_id=message.from_user.id, state=FastingStates.WAITING_TIME)
+        await state.set_state(FastingStates.WAITING_TIME)
 
-# Команда /edit_time
 @dp.message(Command("edit_time"))
-async def edit_time_handler(message: types.Message):
+async def edit_time_handler(message: types.Message, state: FSMContext):
     await message.answer(
         "🔄 Введите новое время последнего приема пищи (ЧЧ:ММ) или /now",
         reply_markup=types.ReplyKeyboardRemove()
     )
-    await dp.fsm.set_state(user_id=message.from_user.id, state=FastingStates.WAITING_TIME)
+    await state.set_state(FastingStates.WAITING_TIME)
 
-# ========================
-# Запуск бота
-# ========================
+@dp.message(FastingStates.FASTING_PERIOD)
+async def fasting_period_handler(message: types.Message, state: FSMContext):
+    if message.text == "✏️ Изменить время":
+        await message.answer(
+            "🔄 Введите новое время последнего приема пищи (ЧЧ:ММ) или /now",
+            reply_markup=types.ReplyKeyboardRemove()
+        )
+        await state.set_state(FastingStates.WAITING_TIME)
 
 async def main():
     scheduler.start()
